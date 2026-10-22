@@ -1,0 +1,1055 @@
+-- [[ imdivine Silent Aim & Camlock Script - Divines Lovely HC Edition ]]
+local UIS = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local lp = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+local mouse = lp:GetMouse()
+
+local cfg = {
+    silentAim = true,
+    useKeybind = true,
+    silentAimKey = Enum.KeyCode.V,
+    uiToggleKey = Enum.KeyCode.RightControl,
+    silentAimHitChance = 100,
+    silentAimFOV = 150,
+    silentAimFOVShow = true,
+    silentAimFOVFilled = false,
+    silentAimFOVOpacity = 0.3,
+    silentAimFOVColor = Color3.fromRGB(160, 210, 235),
+    
+    -- Camlock Settings
+    camlockMode = false,
+    strictCamlock = false, -- Only locks onto the chosen person until they die
+    camlockKey = Enum.KeyCode.C,
+    camlockSmoothness = 5,
+    camlockPrediction = 0.12,
+    camlockWallCheck = true,
+    camlockSelectedPlayer = nil, -- nil means closest to cursor
+    
+    -- ESP Settings
+    usernameESP = false,
+    highlightESP = false,
+    
+    -- Hitbox Expander Settings
+    hitboxExpander = false,
+    hitboxScale = 3,
+    
+    -- Extra Settings
+    noFog = false,
+    fogDistance = 10000,
+    
+    silentAimPart = "Head",
+    silentAimClosestPart = false,
+    
+    silentAimTeamCheck = false,
+    silentAimWallCheck = false,
+    silentAimMaxDist = 1000,
+    
+    silentAimPredX = 0,
+    silentAimPredY = 0,
+    silentAimPredZ = 0,
+    
+    bypassRevolver = false,
+}
+
+local bodyPartsList = {
+    "Head", "UpperTorso", "HumanoidRootPart", "LowerTorso",
+    "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
+    "LeftHand", "RightHand", "LeftUpperLeg", "RightUpperLeg",
+    "LeftLowerLeg", "RightLowerLeg", "LeftFoot", "RightFoot"
+}
+
+-- FOV Circle Drawing Setup
+local fovCircle = Drawing.new("Circle")
+fovCircle.Thickness = 1.5
+fovCircle.NumSides = 64
+fovCircle.Radius = cfg.silentAimFOV
+fovCircle.Color = cfg.silentAimFOVColor
+fovCircle.Filled = cfg.silentAimFOVFilled
+fovCircle.Visible = cfg.silentAimFOVShow
+fovCircle.Transparency = cfg.silentAimFOVOpacity
+
+local silentAimCachedPart = nil
+local camlockTarget = nil
+local espBillboards = {}
+local espHighlights = {}
+local originalHitboxSizes = {}
+
+local function isHoldingRevolver()
+    if not cfg.bypassRevolver then return false end
+    local char = lp.Character
+    if not char then return false end
+    
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then
+        local toolName = string.lower(tool.Name)
+        if string.find(toolName, "revolver") or string.find(toolName, "rev") then
+            return true
+        end
+    end
+    return false
+end
+
+local function getHum(p)
+    local c = p and p.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function getHRP(p)
+    local c = p and p.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function isAlive(p)
+    local h = getHum(p)
+    return h and h.Health > 0
+end
+
+local function sameTeam(p)
+    return lp.Team and p.Team and lp.Team == p.Team
+end
+
+local function wallBetween(pos)
+    local ro = cam.CFrame.Position
+    local rd = pos - ro
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = {lp.Character}
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local hit = workspace:Raycast(ro, rd, params)
+    if not hit then return false end
+    for _, p in pairs(Players:GetPlayers()) do
+        if p.Character and hit.Instance:IsDescendantOf(p.Character) then return false end
+    end
+    return true
+end
+
+local function safeWorldToViewportPoint(pos)
+    local sp, on = Vector3.new(), false
+    pcall(function()
+        sp, on = cam:WorldToViewportPoint(pos)
+    end)
+    return sp, on
+end
+
+local function getClosestBodyPart(char)
+    local closestPart, shortestDist = nil, math.huge
+    local mousePos = UIS:GetMouseLocation()
+    for _, pName in ipairs(bodyPartsList) do
+        local part = char:FindFirstChild(pName)
+        if part then
+            local screenPos, onScreen = safeWorldToViewportPoint(part.Position)
+            local dist = onScreen and (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude or math.huge
+            if dist < shortestDist then
+                shortestDist = dist
+                closestPart = part
+            end
+        end
+    end
+    return closestPart or char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getTargetPart(char)
+    if not char then return nil end
+    if cfg.silentAimClosestPart then
+        return getClosestBodyPart(char)
+    end
+    return char:FindFirstChild(cfg.silentAimPart) or char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getClosestPlayerToCursor()
+    if isHoldingRevolver() then return nil end
+    
+    local closestPlayer = nil
+    local shortestDist = cfg.silentAimFOV
+    local mousePos = UIS:GetMouseLocation()
+
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= lp and isAlive(p) then
+            if cfg.silentAimTeamCheck and sameTeam(p) then continue end
+            local hrp = getHRP(p)
+            if hrp then
+                local dist3D = (hrp.Position - cam.CFrame.Position).Magnitude
+                if dist3D <= cfg.silentAimMaxDist then
+                    local sp, onScreen = safeWorldToViewportPoint(hrp.Position)
+                    if onScreen then
+                        local dist2D = (Vector2.new(sp.X, sp.Y) - mousePos).Magnitude
+                        if dist2D < shortestDist then
+                            local part = getTargetPart(p.Character)
+                            if part then
+                                if not cfg.silentAimWallCheck or not wallBetween(part.Position) then
+                                    shortestDist = dist2D
+                                    closestPlayer = part
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closestPlayer
+end
+
+local function getClosestPlayerForCamlock()
+    local closestPart = nil
+    local shortestDist = math.huge
+    local mousePos = UIS:GetMouseLocation()
+
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= lp and isAlive(p) then
+            local hrp = getHRP(p)
+            if hrp then
+                local sp, onScreen = safeWorldToViewportPoint(hrp.Position)
+                if onScreen then
+                    local dist2D = (Vector2.new(sp.X, sp.Y) - mousePos).Magnitude
+                    if dist2D < shortestDist then
+                        local part = getTargetPart(p.Character)
+                        if part then
+                            shortestDist = dist2D
+                            closestPart = part
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closestPart
+end
+
+-- ==================== UI SETUP ====================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "DivinesLovelyHCUI"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 999999
+
+local success = pcall(function()
+    screenGui.Parent = CoreGui
+end)
+if not success or not screenGui.Parent then
+    screenGui.Parent = lp:WaitForChild("PlayerGui")
+end
+
+-- Notification Holder
+local notifHolder = Instance.new("Frame")
+notifHolder.Name = "NotificationHolder"
+notifHolder.Size = UDim2.new(0, 240, 1, 0)
+notifHolder.Position = UDim2.new(1, -260, 0, 0)
+notifHolder.BackgroundTransparency = 1
+notifHolder.Parent = screenGui
+
+local notifLayout = Instance.new("UIListLayout")
+notifLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+notifLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+notifLayout.SortOrder = Enum.SortOrder.LayoutOrder
+notifLayout.Padding = UDim.new(0, 8)
+notifLayout.Parent = notifHolder
+
+local function sendNotification(title, state)
+    local notifBox = Instance.new("Frame")
+    notifBox.Size = UDim2.new(0, 240, 0, 48)
+    notifBox.Position = UDim2.new(1, 50, 0, 0)
+    notifBox.BackgroundColor3 = Color3.fromRGB(240, 248, 255)
+    notifBox.BorderSizePixel = 0
+    notifBox.Parent = notifHolder
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = notifBox
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(176, 224, 230)
+    stroke.Thickness = 2
+    stroke.Parent = notifBox
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -12, 0, 20)
+    titleLabel.Position = UDim2.new(0, 12, 0, 4)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Font = Enum.Font.FredokaOne
+    titleLabel.Text = title
+    titleLabel.TextColor3 = Color3.fromRGB(70, 130, 180)
+    titleLabel.TextSize = 13
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = notifBox
+
+    local stateLabel = Instance.new("TextLabel")
+    stateLabel.Size = UDim2.new(1, -12, 0, 18)
+    stateLabel.Position = UDim2.new(0, 12, 0, 22)
+    stateLabel.BackgroundTransparency = 1
+    stateLabel.Font = Enum.Font.GothamBold
+    stateLabel.Text = type(state) == "boolean" and (state and "Status: <font color=\"#55AA55\">ON (ENABLED)</font>" or "Status: <font color=\"#AA5555\">OFF (DISABLED)</font>") or ("Target: <font color=\"#5588AA\">" .. tostring(state) .. "</font>")
+    stateLabel.RichText = true
+    stateLabel.TextColor3 = Color3.fromRGB(110, 150, 180)
+    stateLabel.TextSize = 11
+    stateLabel.TextXAlignment = Enum.TextXAlignment.Left
+    stateLabel.Parent = notifBox
+
+    local tweenIn = TweenService:Create(notifBox, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Position = UDim2.new(0, 0, 0, 0)})
+    tweenIn:Play()
+
+    task.spawn(function()
+        task.wait(2.5)
+        local tweenOut = TweenService:Create(notifBox, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Position = UDim2.new(1, 50, 0, 0)})
+        tweenOut:Play()
+        tweenOut.Completed:Wait()
+        notifBox:Destroy()
+    end)
+end
+
+-- FOG OVERRIDE
+local storedEffects = {}
+local function updateFog()
+    if cfg.noFog then
+        Lighting.FogEnd = 9e9
+        Lighting.FogStart = 9e9
+        Lighting.GlobalShadows = false
+        for _, obj in ipairs(Lighting:GetChildren()) do
+            if obj:IsA("Atmosphere") or obj:IsA("BlurEffect") or obj:IsA("DepthOfFieldEffect") or obj:IsA("SunRaysEffect") then
+                if not storedEffects[obj] then storedEffects[obj] = obj.Parent end
+                obj.Parent = nil
+            end
+        end
+    else
+        Lighting.FogEnd = cfg.fogDistance
+        Lighting.FogStart = 0
+        Lighting.GlobalShadows = true
+        for obj, originalParent in pairs(storedEffects) do
+            if obj and originalParent then obj.Parent = originalParent end
+        end
+        storedEffects = {}
+    end
+end
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 500, 0, 500)
+mainFrame.Position = UDim2.new(0.5, -250, 0.5, -250)
+mainFrame.BackgroundColor3 = Color3.fromRGB(240, 248, 255)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 16)
+corner.Parent = mainFrame
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(176, 224, 230)
+stroke.Thickness = 3
+stroke.Parent = mainFrame
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, 0, 0, 26)
+titleLabel.Position = UDim2.new(0, 0, 0, 6)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Font = Enum.Font.FredokaOne
+titleLabel.Text = "💎 Divines Lovely HC 💎"
+titleLabel.TextColor3 = Color3.fromRGB(70, 130, 180)
+titleLabel.TextSize = 18
+titleLabel.Parent = mainFrame
+
+local creditLabel = Instance.new("TextLabel")
+creditLabel.Size = UDim2.new(1, 0, 0, 16)
+creditLabel.Position = UDim2.new(0, 0, 0, 30)
+creditLabel.BackgroundTransparency = 1
+creditLabel.Font = Enum.Font.GothamBold
+creditLabel.Text = "made by: .imdivine (DC)"
+creditLabel.TextColor3 = Color3.fromRGB(130, 170, 200)
+creditLabel.TextSize = 11
+creditLabel.Parent = mainFrame
+
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Size = UDim2.new(0, 30, 0, 30)
+minimizeBtn.Position = UDim2.new(1, -38, 0, 10)
+minimizeBtn.BackgroundColor3 = Color3.fromRGB(224, 238, 238)
+minimizeBtn.Font = Enum.Font.GothamBold
+minimizeBtn.Text = "-"
+minimizeBtn.TextColor3 = Color3.fromRGB(70, 130, 180)
+minimizeBtn.TextSize = 16
+minimizeBtn.ZIndex = 5
+minimizeBtn.Parent = mainFrame
+
+local minCorner = Instance.new("UICorner")
+minCorner.CornerRadius = UDim.new(0, 8)
+minCorner.Parent = minimizeBtn
+
+-- Tab Navigation Bar
+local tabNavFrame = Instance.new("Frame")
+tabNavFrame.Size = UDim2.new(1, -20, 0, 34)
+tabNavFrame.Position = UDim2.new(0, 10, 0, 52)
+tabNavFrame.BackgroundTransparency = 1
+tabNavFrame.Parent = mainFrame
+
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.Padding = UDim.new(0, 2)
+tabLayout.Parent = tabNavFrame
+
+-- Sections Container Frame
+local sectionsContainer = Instance.new("Frame")
+sectionsContainer.Size = UDim2.new(1, -20, 1, -100)
+sectionsContainer.Position = UDim2.new(0, 10, 0, 92)
+sectionsContainer.BackgroundTransparency = 1
+sectionsContainer.Parent = mainFrame
+
+local sections = {}
+
+local function createSectionFrame(name)
+    local sf = Instance.new("ScrollingFrame")
+    sf.Name = name .. "Section"
+    sf.Size = UDim2.new(1, 0, 1, 0)
+    sf.BackgroundTransparency = 1
+    sf.BorderSizePixel = 0
+    sf.CanvasSize = UDim2.new(0, 0, 0, 700)
+    sf.ScrollBarThickness = 4
+    sf.Visible = false
+    sf.Parent = sectionsContainer
+
+    local list = Instance.new("UIListLayout")
+    list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Padding = UDim.new(0, 8)
+    list.Parent = sf
+
+    sections[name] = sf
+    return sf
+end
+
+local function createButton(parent, name, defaultText, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -10, 0, 36)
+    btn.BackgroundColor3 = Color3.fromRGB(224, 238, 238)
+    btn.BorderSizePixel = 0
+    btn.AutoButtonColor = true
+    btn.Font = Enum.Font.GothamBold
+    btn.Text = name .. ": " .. defaultText
+    btn.TextColor3 = Color3.fromRGB(90, 140, 170)
+    btn.TextSize = 14
+    btn.ZIndex = 2
+    
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent = btn
+    
+    btn.MouseButton1Down:Connect(callback)
+    btn.Parent = parent
+    return btn
+end
+
+local function createSlider(parent, name, minVal, maxVal, currentVal, callback)
+    local wrapper = Instance.new("Frame")
+    wrapper.Size = UDim2.new(1, -10, 0, 45)
+    wrapper.BackgroundTransparency = 1
+    wrapper.ZIndex = 2
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 0, 18)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.Text = "  " .. name .. ": " .. tostring(currentVal)
+    label.TextColor3 = Color3.fromRGB(90, 140, 170)
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.ZIndex = 2
+    label.Parent = wrapper
+    
+    local sliderBar = Instance.new("TextButton")
+    sliderBar.AutoButtonColor = false
+    sliderBar.Text = ""
+    sliderBar.Size = UDim2.new(1, -10, 0, 10)
+    sliderBar.Position = UDim2.new(0, 5, 0, 24)
+    sliderBar.BackgroundColor3 = Color3.fromRGB(224, 238, 238)
+    sliderBar.BorderSizePixel = 0
+    sliderBar.ZIndex = 2
+    sliderBar.Parent = wrapper
+    
+    local barCorner = Instance.new("UICorner")
+    barCorner.CornerRadius = UDim.new(1, 0)
+    barCorner.Parent = sliderBar
+    
+    local fillBar = Instance.new("Frame")
+    local initialRatio = (currentVal - minVal) / (maxVal - minVal)
+    fillBar.Size = UDim2.new(initialRatio, 0, 1, 0)
+    fillBar.BackgroundColor3 = Color3.fromRGB(135, 206, 250)
+    fillBar.BorderSizePixel = 0
+    fillBar.ZIndex = 3
+    fillBar.Parent = sliderBar
+    
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(1, 0)
+    fillCorner.Parent = fillBar
+
+    local sliderThumb = Instance.new("Frame")
+    sliderThumb.Size = UDim2.new(0, 16, 0, 16)
+    sliderThumb.AnchorPoint = Vector2.new(0.5, 0.5)
+    sliderThumb.Position = UDim2.new(initialRatio, 0, 0.5, 0)
+    sliderThumb.BackgroundColor3 = Color3.fromRGB(70, 130, 180)
+    sliderThumb.BorderSizePixel = 0
+    sliderThumb.ZIndex = 4
+    sliderThumb.Parent = sliderBar
+
+    local thumbCorner = Instance.new("UICorner")
+    thumbCorner.CornerRadius = UDim.new(1, 0)
+    thumbCorner.Parent = sliderThumb
+    
+    local dragging = false
+    
+    local function updateSlider(input)
+        local mousePos = input.Position.X
+        local barPos = sliderBar.AbsolutePosition.X
+        local barSize = sliderBar.AbsoluteSize.X
+        local posRatio = math.clamp((mousePos - barPos) / barSize, 0, 1)
+        
+        local newVal = minVal + (maxVal - minVal) * posRatio
+        if maxVal > 1 and maxVal ~= 0.3 and maxVal ~= 0.5 then
+            newVal = math.floor(newVal)
+        else
+            newVal = tonumber(string.format("%.2f", newVal))
+        end
+        
+        fillBar.Size = UDim2.new(posRatio, 0, 1, 0)
+        sliderThumb.Position = UDim2.new(posRatio, 0, 0.5, 0)
+        label.Text = "  " .. name .. ": " .. tostring(newVal)
+        callback(newVal)
+    end
+    
+    sliderBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            updateSlider(input)
+        end
+    end)
+    
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            updateSlider(input)
+        end
+    end)
+    
+    wrapper.Parent = parent
+end
+
+-- Create Individual Section Frames
+local homeSec = createSectionFrame("Home")
+local silentAimSec = createSectionFrame("SilentAim")
+local camlockSec = createSectionFrame("Camlock")
+local espSec = createSectionFrame("ESP")
+local hitboxSec = createSectionFrame("Hitbox")
+local extraSec = createSectionFrame("Extra")
+
+-- Populate Home Section
+local welcomeCard = Instance.new("Frame")
+welcomeCard.Size = UDim2.new(1, -10, 0, 90)
+welcomeCard.BackgroundColor3 = Color3.fromRGB(224, 238, 238)
+welcomeCard.BorderSizePixel = 0
+welcomeCard.Parent = homeSec
+
+local welcomeCorner = Instance.new("UICorner")
+welcomeCorner.CornerRadius = UDim.new(0, 10)
+welcomeCorner.Parent = welcomeCard
+
+local welcomeText = Instance.new("TextLabel")
+welcomeText.Size = UDim2.new(1, -20, 1, 0)
+welcomeText.Position = UDim2.new(0, 10, 0, 0)
+welcomeText.BackgroundTransparency = 1
+welcomeText.Font = Enum.Font.FredokaOne
+welcomeText.Text = "Welcome, " .. lp.Name .. "!\n<font size='12' color='#5588AA'>Select a category above to configure your options.</font>"
+welcomeText.RichText = true
+welcomeText.TextColor3 = Color3.fromRGB(70, 130, 180)
+welcomeText.TextSize = 15
+welcomeText.TextWrapped = true
+welcomeText.Parent = welcomeCard
+
+local infoCard = Instance.new("Frame")
+infoCard.Size = UDim2.new(1, -10, 0, 110)
+infoCard.BackgroundColor3 = Color3.fromRGB(224, 238, 238)
+infoCard.BorderSizePixel = 0
+infoCard.Parent = homeSec
+
+local infoCorner = Instance.new("UICorner")
+infoCorner.CornerRadius = UDim.new(0, 10)
+infoCorner.Parent = infoCard
+
+local infoText = Instance.new("TextLabel")
+infoText.Size = UDim2.new(1, -20, 1, 0)
+infoText.Position = UDim2.new(0, 10, 0, 0)
+infoText.BackgroundTransparency = 1
+infoText.Font = Enum.Font.GothamBold
+infoText.Text = "Quick Info:\n• UI Toggle Key: Right Control\n• Silent Aim Key: V\n• Camlock Key: C\n• Made by .imdivine"
+infoText.TextColor3 = Color3.fromRGB(90, 140, 170)
+infoText.TextSize = 12
+infoText.TextXAlignment = Enum.TextXAlignment.Left
+infoText.Parent = infoCard
+
+-- Populate Silent Aim Section
+local silentAimToggleBtn
+silentAimToggleBtn = createButton(silentAimSec, "Silent Aim Mode", cfg.silentAim and "ON" or "OFF", function()
+    cfg.silentAim = not cfg.silentAim
+    silentAimToggleBtn.Text = "Silent Aim Mode: " .. (cfg.silentAim and "ON" or "OFF")
+    sendNotification("Silent Aim Mode", cfg.silentAim)
+end)
+
+local fovToggleBtn
+fovToggleBtn = createButton(silentAimSec, "FOV Circle", cfg.silentAimFOVShow and "ON" or "OFF", function()
+    cfg.silentAimFOVShow = not cfg.silentAimFOVShow
+    fovCircle.Visible = cfg.silentAimFOVShow
+    fovToggleBtn.Text = "FOV Circle: " .. (cfg.silentAimFOVShow and "ON" or "OFF")
+    sendNotification("FOV Circle", cfg.silentAimFOVShow)
+end)
+
+createSlider(silentAimSec, "FOV Radius", 10, 500, cfg.silentAimFOV, function(val)
+    cfg.silentAimFOV = val
+    fovCircle.Radius = cfg.silentAimFOV
+end)
+
+createSlider(silentAimSec, "Transparency", 0, 1, cfg.silentAimFOVOpacity, function(val)
+    cfg.silentAimFOVOpacity = val
+    fovCircle.Transparency = cfg.silentAimFOVOpacity
+end)
+
+-- Populate Camlock Section
+local camlockToggleBtn
+camlockToggleBtn = createButton(camlockSec, "Camlock Mode", cfg.camlockMode and "ON" or "OFF", function()
+    cfg.camlockMode = not cfg.camlockMode
+    camlockToggleBtn.Text = "Camlock Mode: " .. (cfg.camlockMode and "ON" or "OFF")
+    if not cfg.camlockMode then
+        camlockTarget = nil
+    end
+    sendNotification("Camlock Mode", cfg.camlockMode)
+end)
+
+local strictCamlockToggleBtn
+strictCamlockToggleBtn = createButton(camlockSec, "Strict Target Lock", cfg.strictCamlock and "ON" or "OFF", function()
+    cfg.strictCamlock = not cfg.strictCamlock
+    strictCamlockToggleBtn.Text = "Strict Target Lock: " .. (cfg.strictCamlock and "ON" or "OFF")
+    sendNotification("Strict Target Lock", cfg.strictCamlock)
+end)
+
+local camlockWallCheckBtn
+camlockWallCheckBtn = createButton(camlockSec, "Camlock WallCheck", cfg.camlockWallCheck and "ON" or "OFF", function()
+    cfg.camlockWallCheck = not cfg.camlockWallCheck
+    camlockWallCheckBtn.Text = "Camlock WallCheck: " .. (cfg.camlockWallCheck and "ON" or "OFF")
+    sendNotification("Camlock WallCheck", cfg.camlockWallCheck)
+end)
+
+createSlider(camlockSec, "Camlock Smoothness", 1, 20, cfg.camlockSmoothness, function(val)
+    cfg.camlockSmoothness = val
+end)
+
+createSlider(camlockSec, "Prediction Scale", 0, 0.3, cfg.camlockPrediction, function(val)
+    cfg.camlockPrediction = val
+end)
+
+-- Player List Section for Camlock
+local playerListHeader = Instance.new("TextLabel")
+playerListHeader.Size = UDim2.new(1, -10, 0, 22)
+playerListHeader.BackgroundTransparency = 1
+playerListHeader.Font = Enum.Font.FredokaOne
+playerListHeader.Text = "👥 Target Player Selector"
+playerListHeader.TextColor3 = Color3.fromRGB(70, 130, 180)
+playerListHeader.TextSize = 13
+playerListHeader.TextXAlignment = Enum.TextXAlignment.Left
+playerListHeader.Parent = camlockSec
+
+local playerScrollContainer = Instance.new("ScrollingFrame")
+playerScrollContainer.Size = UDim2.new(1, -10, 0, 110)
+playerScrollContainer.BackgroundColor3 = Color3.fromRGB(224, 238, 238)
+playerScrollContainer.BorderSizePixel = 0
+playerScrollContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+playerScrollContainer.ScrollBarThickness = 4
+playerScrollContainer.Parent = camlockSec
+
+local playerScrollCorner = Instance.new("UICorner")
+playerScrollCorner.CornerRadius = UDim.new(0, 10)
+playerScrollCorner.Parent = playerScrollContainer
+
+local playerListLayout = Instance.new("UIListLayout")
+playerListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+playerListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+playerListLayout.Padding = UDim.new(0, 4)
+playerListLayout.Parent = playerScrollContainer
+
+local refreshBtn = createButton(camlockSec, "Refresh Player List", "Click to Update", function()
+    refreshPlayerList()
+    sendNotification("Player List", "Refreshed successfully!")
+end)
+
+local function refreshPlayerList()
+    for _, child in ipairs(playerScrollContainer:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+
+    local autoBtn = Instance.new("TextButton")
+    autoBtn.Size = UDim2.new(1, -8, 0, 28)
+    autoBtn.BackgroundColor3 = (cfg.camlockSelectedPlayer == nil) and Color3.fromRGB(135, 206, 250) or Color3.fromRGB(240, 248, 255)
+    autoBtn.Font = Enum.Font.GothamBold
+    autoBtn.Text = "Mode: Closest to Cursor (Auto)"
+    autoBtn.TextColor3 = (cfg.camlockSelectedPlayer == nil) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(90, 140, 170)
+    autoBtn.TextSize = 11
+    autoBtn.Parent = playerScrollContainer
+
+    local ac = Instance.new("UICorner")
+    ac.CornerRadius = UDim.new(0, 6)
+    ac.Parent = autoBtn
+
+    autoBtn.MouseButton1Down:Connect(function()
+        cfg.camlockSelectedPlayer = nil
+        refreshPlayerList()
+        sendNotification("Camlock Target", "Auto (Closest to Cursor)")
+    end)
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= lp then
+            local pBtn = Instance.new("TextButton")
+            pBtn.Size = UDim2.new(1, -8, 0, 28)
+            pBtn.BackgroundColor3 = (cfg.camlockSelectedPlayer == p) and Color3.fromRGB(135, 206, 250) or Color3.fromRGB(240, 248, 255)
+            pBtn.Font = Enum.Font.GothamBold
+            pBtn.Text = p.Name .. " (@" .. p.DisplayName .. ")"
+            pBtn.TextColor3 = (cfg.camlockSelectedPlayer == p) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(90, 140, 170)
+            pBtn.TextSize = 11
+            pBtn.Parent = playerScrollContainer
+
+            local cc = Instance.new("UICorner")
+            cc.CornerRadius = UDim.new(0, 6)
+            cc.Parent = pBtn
+
+            pBtn.MouseButton1Down:Connect(function()
+                cfg.camlockSelectedPlayer = p
+                refreshPlayerList()
+                sendNotification("Camlock Target", p.Name)
+            end)
+        end
+    end
+    playerScrollContainer.CanvasSize = UDim2.new(0, 0, 0, (#Players:GetPlayers()) * 32)
+end
+
+Players.PlayerAdded:Connect(function() refreshPlayerList() end)
+Players.PlayerRemoving:Connect(function() refreshPlayerList() end)
+refreshPlayerList()
+
+-- Populate ESP Section
+local espToggleBtn
+espToggleBtn = createButton(espSec, "Username ESP", cfg.usernameESP and "ON" or "OFF", function()
+    cfg.usernameESP = not cfg.usernameESP
+    espToggleBtn.Text = "Username ESP: " .. (cfg.usernameESP and "ON" or "OFF")
+    sendNotification("Username ESP", cfg.usernameESP)
+    if not cfg.usernameESP then
+        for _, bb in pairs(espBillboards) do
+            if bb then bb:Destroy() end
+        end
+        espBillboards = {}
+    end
+end)
+
+local highlightToggleBtn
+highlightToggleBtn = createButton(espSec, "Highlight Players", cfg.highlightESP and "ON" or "OFF", function()
+    cfg.highlightESP = not cfg.highlightESP
+    highlightToggleBtn.Text = "Highlight Players: " .. (cfg.highlightESP and "ON" or "OFF")
+    sendNotification("Highlight Players", cfg.highlightESP)
+    if not cfg.highlightESP then
+        for _, hl in pairs(espHighlights) do
+            if hl then hl:Destroy() end
+        end
+        espHighlights = {}
+    end
+end)
+
+-- Populate Hitbox Expander Section
+local hitboxToggleBtn
+hitboxToggleBtn = createButton(hitboxSec, "Hitbox Expander", cfg.hitboxExpander and "ON" or "OFF", function()
+    cfg.hitboxExpander = not cfg.hitboxExpander
+    hitboxToggleBtn.Text = "Hitbox Expander: " .. (cfg.hitboxExpander and "ON" or "OFF")
+    sendNotification("Hitbox Expander", cfg.hitboxExpander)
+    if not cfg.hitboxExpander then
+        for part, origSize in pairs(originalHitboxSizes) do
+            if part and part.Parent then
+                part.Size = origSize
+                part.Transparency = 0
+            end
+        end
+        originalHitboxSizes = {}
+    end
+end)
+
+createSlider(hitboxSec, "Hitbox Scale", 1, 10, cfg.hitboxScale, function(val)
+    cfg.hitboxScale = val
+end)
+
+-- Populate Extra Section
+local noFogToggleBtn
+noFogToggleBtn = createButton(extraSec, "No Fog", cfg.noFog and "ON" or "OFF", function()
+    cfg.noFog = not cfg.noFog
+    noFogToggleBtn.Text = "No Fog: " .. (cfg.noFog and "ON" or "OFF")
+    updateFog()
+    sendNotification("No Fog", cfg.noFog)
+end)
+
+createSlider(extraSec, "Fog Distance", 100, 100000, cfg.fogDistance, function(val)
+    cfg.fogDistance = val
+    updateFog()
+end)
+
+-- Tab Switcher Logic
+local activeTabBtn = nil
+local function switchTab(sectionName, tabBtn)
+    for name, sec in pairs(sections) do
+        sec.Visible = (name == sectionName)
+    end
+    if activeTabBtn then
+        activeTabBtn.BackgroundColor3 = Color3.fromRGB(224, 238, 238)
+        activeTabBtn.TextColor3 = Color3.fromRGB(90, 140, 170)
+    end
+    activeTabBtn = tabBtn
+    tabBtn.BackgroundColor3 = Color3.fromRGB(135, 206, 250)
+    tabBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+end
+
+local function createTabButton(name, displayName)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.16, 0, 1, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(224, 238, 238)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.Text = displayName
+    btn.TextColor3 = Color3.fromRGB(90, 140, 170)
+    btn.TextSize = 9
+    btn.Parent = tabNavFrame
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 8)
+    c.Parent = btn
+
+    btn.MouseButton1Down:Connect(function()
+        switchTab(name, btn)
+    end)
+    return btn
+end
+
+local homeTab = createTabButton("Home", "Home")
+local silentAimTab = createTabButton("SilentAim", "Silent Aim")
+local camlockTab = createTabButton("Camlock", "Camlock")
+local espTab = createTabButton("ESP", "ESP")
+local hitboxTab = createTabButton("Hitbox", "Hitbox")
+local extraTab = createTabButton("Extra", "Extra")
+
+-- Default to Home tab
+switchTab("Home", homeTab)
+
+local isMinimized = false
+minimizeBtn.MouseButton1Down:Connect(function()
+    isMinimized = not isMinimized
+    sectionsContainer.Visible = not isMinimized
+    tabNavFrame.Visible = not isMinimized
+    minimizeBtn.Text = isMinimized and "+" or "-"
+    mainFrame.Size = isMinimized and UDim2.new(0, 500, 0, 50) or UDim2.new(0, 500, 0, 500)
+end)
+
+-- ==========================================================
+
+-- RenderStepped loop
+RunService.RenderStepped:Connect(function()
+    local mousePos = UIS:GetMouseLocation()
+    fovCircle.Position = mousePos
+    fovCircle.Radius = cfg.silentAimFOV
+    fovCircle.Visible = cfg.silentAimFOVShow
+    fovCircle.Transparency = cfg.silentAimFOVOpacity
+    
+    if cfg.silentAim then
+        silentAimCachedPart = getClosestPlayerToCursor()
+    else
+        silentAimCachedPart = nil
+    end
+
+    -- Strict Target Lock death check
+    if cfg.strictCamlock and camlockTarget then
+        local p = Players:GetPlayerFromCharacter(camlockTarget.Parent)
+        if not p or not isAlive(p) then
+            camlockTarget = nil
+        end
+    end
+
+    -- Hitbox Expander loop logic
+    if cfg.hitboxExpander then
+        for _, p in pairs(Players:GetPlayers()) do
+            if p ~= lp and isAlive(p) then
+                local char = p.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    if not originalHitboxSizes[hrp] then
+                        originalHitboxSizes[hrp] = hrp.Size
+                    end
+                    hrp.Size = Vector3.new(cfg.hitboxScale, cfg.hitboxScale, cfg.hitboxScale)
+                    hrp.Transparency = 0.7
+                    hrp.CanCollide = false
+                end
+            end
+        end
+    end
+
+    -- ESP Rendering Loop
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= lp then
+            local char = p.Character
+            local head = char and char:FindFirstChild("Head")
+            
+            -- Username ESP
+            if cfg.usernameESP and isAlive(p) and head then
+                if not espBillboards[p] then
+                    local bb = Instance.new("BillboardGui")
+                    bb.Name = "DivineESP"
+                    bb.Size = UDim2.new(0, 100, 0, 40)
+                    bb.StudsOffset = Vector3.new(0, 2.5, 0)
+                    bb.AlwaysOnTop = true
+                    bb.Parent = head
+                    
+                    local txt = Instance.new("TextLabel")
+                    txt.Size = UDim2.new(1, 0, 1, 0)
+                    txt.BackgroundTransparency = 1
+                    txt.Font = Enum.Font.GothamBold
+                    txt.TextColor3 = Color3.fromRGB(160, 210, 235)
+                    txt.TextSize = 12
+                    txt.TextStrokeTransparency = 0.5
+                    txt.Text = p.Name
+                    txt.Parent = bb
+                    
+                    espBillboards[p] = bb
+                end
+            else
+                if espBillboards[p] then
+                    espBillboards[p]:Destroy()
+                    espBillboards[p] = nil
+                end
+            end
+
+            -- Highlight ESP
+            if cfg.highlightESP and isAlive(p) and char then
+                if not espHighlights[p] then
+                    local hl = Instance.new("Highlight")
+                    hl.Name = "DivineHighlight"
+                    hl.Adornee = char
+                    hl.FillColor = Color3.fromRGB(135, 206, 250)
+                    hl.OutlineColor = Color3.fromRGB(70, 130, 180)
+                    hl.FillTransparency = 0.5
+                    hl.Parent = char
+                    
+                    espHighlights[p] = hl
+                end
+            else
+                if espHighlights[p] then
+                    espHighlights[p]:Destroy()
+                    espHighlights[p] = nil
+                end
+            end
+        end
+    end
+
+    -- Camlock Logic
+    if cfg.camlockMode then
+        if not camlockTarget or not cfg.strictCamlock then
+            if cfg.camlockSelectedPlayer then
+                if isAlive(cfg.camlockSelectedPlayer) then
+                    camlockTarget = getTargetPart(cfg.camlockSelectedPlayer.Character)
+                else
+                    camlockTarget = nil
+                end
+            else
+                camlockTarget = getClosestPlayerForCamlock()
+            end
+        end
+
+        if camlockTarget then
+            local isBehindWall = false
+            if cfg.camlockWallCheck then
+                isBehindWall = wallBetween(camlockTarget.Position)
+            end
+
+            if not isBehindWall then
+                local targetPos = camlockTarget.Position
+                local hrp = camlockTarget.Parent:FindFirstChild("HumanoidRootPart")
+                if hrp and cfg.camlockPrediction > 0 then
+                    targetPos = targetPos + (hrp.Velocity * cfg.camlockPrediction)
+                end
+                
+                local currentCFrame = cam.CFrame
+                local targetCFrame = CFrame.new(currentCFrame.Position, targetPos)
+                local smoothness = math.clamp(cfg.camlockSmoothness, 1, 20)
+                cam.CFrame = currentCFrame:Lerp(targetCFrame, 1 / smoothness)
+            end
+        end
+    else
+        if not cfg.strictCamlock then
+            camlockTarget = nil
+        end
+    end
+end)
+
+-- Keybind toggles with debounce protection
+local lastKeyToggled = 0
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if tick() - lastKeyToggled < 0.2 then return end
+    
+    if input.KeyCode == cfg.silentAimKey and cfg.useKeybind then
+        lastKeyToggled = tick()
+        cfg.silentAim = not cfg.silentAim
+        silentAimToggleBtn.Text = "Silent Aim Mode: " .. (cfg.silentAim and "ON" or "OFF")
+        sendNotification("Silent Aim Mode", cfg.silentAim)
+    elseif input.KeyCode == cfg.camlockKey then
+        lastKeyToggled = tick()
+        cfg.camlockMode = not cfg.camlockMode
+        camlockToggleBtn.Text = "Camlock Mode: " .. (cfg.camlockMode and "ON" or "OFF")
+        if not cfg.camlockMode then
+            camlockTarget = nil
+        end
+        sendNotification("Camlock Mode", cfg.camlockMode)
+    elseif input.KeyCode == cfg.uiToggleKey then
+        mainFrame.Visible = not mainFrame.Visible
+    end
+end)
+
+-- HOOK METAMETHOD (Ensures Silent Aim actually redirects bullets)
+local mt = getrawmetatable(game)
+local oldIndex = mt.__index
+setreadonly(mt, false)
+
+mt.__index = newcclosure(function(self, key)
+    if not checkcaller() and self == mouse and cfg.silentAim and not isHoldingRevolver() then
+        if (key == "Hit" or key == "Target" or key == "UnitRay") and silentAimCachedPart then
+            if math.random(1, 100) <= cfg.silentAimHitChance then
+                local origin = cam.CFrame.Position
+                local targetPos = silentAimCachedPart.Position + Vector3.new(
+                    silentAimCachedPart.AssemblyLinearVelocity.X * cfg.silentAimPredX,
+                    silentAimCachedPart.AssemblyLinearVelocity.Y * cfg.silentAimPredY,
+                    silentAimCachedPart.AssemblyLinearVelocity.Z * cfg.silentAimPredZ
+                )
+                
+                if key == "Hit" then
+                    return CFrame.new(targetPos)
+                elseif key == "Target" then
+                    return silentAimCachedPart
+                elseif key == "UnitRay" then
+                    return Ray.new(origin, (targetPos - origin).Unit)
+                end
+            end
+        end
+    end
+    return oldIndex(self, key)
+end)
+
+setreadonly(mt, true)
+print("💎 Divines Lovely HC Scripts loaded successfully! Press Right Control to toggle UI.")
